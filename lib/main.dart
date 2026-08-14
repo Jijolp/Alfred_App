@@ -1,10 +1,14 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_litert_lm/flutter_litert_lm.dart';
 import 'package:dio/dio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 // Couleurs Batman
 const batBlack = Color(0xFF050505);
@@ -14,33 +18,155 @@ const batLightGrey = Color(0xFF2A2A2A);
 const batYellow = Color(0xFFF2C200);
 const batRed = Color(0xFFB00020);
 
-void main() {
+// Nom du modèle utilisé
+const String modelName = "Gemma 3n E2B";
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // 1. Initialiser les notifications locales
+  FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
+  await flutterLocalNotificationsPlugin.initialize(
+    const InitializationSettings(android: AndroidInitializationSettings('@mipmap/ic_launcher')),
+  );
+
+  // 2. DEMANDER LA PERMISSION DE NOTIFIER (Requis par Android 13+)
+  final bool? granted = await flutterLocalNotificationsPlugin
+      .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+      ?.requestNotificationsPermission();
+
+  // 3. Créer le canal de notification
+  const AndroidNotificationChannel channel = AndroidNotificationChannel(
+    'alfred_service',
+    'ALFRED Service',
+    description: 'Notifications du service en arrière-plan ALFRED',
+    importance: Importance.low,
+  );
+
+  await flutterLocalNotificationsPlugin
+      .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(channel);
+
+  // 4. Démarrer le service en arrière-plan
+  final service = FlutterBackgroundService();
+  await service.configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: onStart,
+      autoStart: true,
+      isForegroundMode: true,
+      notificationChannelId: 'alfred_service',
+      initialNotificationTitle: 'ALFRED',
+      initialNotificationContent: 'Système en veille',
+      foregroundServiceNotificationId: 888,
+    ),
+    iosConfiguration: IosConfiguration(),
+  );
+  await service.startService();
+
   runApp(const AlfredApp());
 }
 
-class AlfredApp extends StatelessWidget {
-  const AlfredApp({super.key});
+// --- FONCTION DU SERVICE EN ARRIÈRE-PLAN (Le vrai cerveau) ---
+@pragma('vm:entry-point')
+void onStart(ServiceInstance service) async {
+  DartPluginRegistrant.ensureInitialized();
 
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'ALFRED',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: batBlack,
-        colorScheme: const ColorScheme.dark(
-          primary: batYellow,
-          surface: batDarkGrey,
+  LiteLmEngine? engine;
+  LiteLmConversation? conversation;
+  bool isModelLoaded = false;
+  String loadingError = "";
+
+  // Fonction pour charger le modèle
+  Future<void> initModel() async {
+    try {
+      final dir = await getExternalStorageDirectory();
+      if (dir == null) throw Exception("Stockage inaccessible.");
+      final file = File('${dir.path}/gemma-4-E2B-it.litertlm');
+
+      if (!await file.exists()) {
+        throw Exception("Modèle introuvable dans ${dir.path}");
+      }
+
+      final tempDir = await getTemporaryDirectory();
+      final cacheDir = Directory('${tempDir.path}/litert_cache');
+      if (!await cacheDir.exists()) await cacheDir.create(recursive: true);
+
+      engine = await LiteLmEngine.create(
+        LiteLmEngineConfig(
+          modelPath: file.path,
+          backend: LiteLmBackend.gpu,
+          cacheDir: cacheDir.path,
+          audioBackend: LiteLmBackend.cpu,
+          maxNumTokens: 2048,
         ),
-        appBarTheme: const AppBarTheme(backgroundColor: batBlack, elevation: 0),
-      ),
-      home: const ChatScreen(),
-    );
+      );
+
+      conversation = await engine?.createConversation(
+        LiteLmConversationConfig(
+          systemInstruction: "Tu es ALFRED, un majordome. Tu es poli et devoue. Tu appelles l'utilisateur 'Monsieur'.",
+          samplerConfig: LiteLmSamplerConfig(temperature: 0.7, topK: 40, topP: 0.9),
+        ),
+      );
+      isModelLoaded = true;
+      service.invoke('model_loaded');
+    } catch (e) {
+      loadingError = e.toString();
+      service.invoke('model_error', {'error': loadingError});
+    }
   }
+
+  // Lancer le chargement au démarrage du service
+  await initModel();
+
+  // Surveiller la RAM toutes les 2 secondes
+  Timer.periodic(const Duration(seconds: 2), (timer) {
+    final usedRamMb = (ProcessInfo.currentRss / (1024 * 1024)).round();
+    service.invoke('ram_update', {'used': usedRamMb});
+  });
+
+  // Écouter les requêtes de l'interface
+  service.on('check_status').listen((event) {
+    if (isModelLoaded) service.invoke('model_loaded');
+    else if (loadingError.isNotEmpty) service.invoke('model_error', {'error': loadingError});
+  });
+
+  service.on('send_message').listen((event) async {
+    if (conversation == null) return;
+    final prompt = event?['prompt'] as String;
+    final audioPath = event?['audioPath'] as String?;
+
+    final contents = [
+      LiteLmContent.text(prompt),
+      if (audioPath != null) LiteLmContent.audioFile(audioPath),
+    ];
+
+    final buffer = StringBuffer();
+    int tokenCount = 0;
+    DateTime startTime = DateTime.now();
+
+    final subscription = conversation!.sendMultimodalMessageStream(contents).listen(
+          (delta) {
+        final text = delta.text;
+        if (text.isNotEmpty) {
+          buffer.write(text);
+          tokenCount++;
+          final elapsedMs = DateTime.now().difference(startTime).inMilliseconds;
+          final tps = elapsedMs > 0 ? (tokenCount / (elapsedMs / 1000)).round() : 0;
+          service.invoke('new_token', {'text': buffer.toString(), 'tps': tps});
+        }
+      },
+      onDone: () => service.invoke('generation_done'),
+      onError: (e) => service.invoke('generation_error', {'error': e.toString()}),
+    );
+
+    service.on('stop_generation').listen((event) {
+      subscription.cancel();
+      service.invoke('generation_done');
+    });
+  });
 }
 
-// --- GESTIONNAIRE DE MÉMOIRE & SERVEUR ---
+// --- GESTIONNAIRE DE MÉMOIRE ---
 class ServerManager {
   final String _serverUrl = "http://100.74.55.124:8000";
   final Dio _dio = Dio(BaseOptions(connectTimeout: const Duration(seconds: 3)));
@@ -59,6 +185,25 @@ class ServerManager {
 }
 
 // --- ÉCRAN PRINCIPAL ---
+class AlfredApp extends StatelessWidget {
+  const AlfredApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'ALFRED',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: batBlack,
+        colorScheme: const ColorScheme.dark(primary: batYellow, surface: batDarkGrey),
+        appBarTheme: const AppBarTheme(backgroundColor: batBlack, elevation: 0),
+      ),
+      home: const ChatScreen(),
+    );
+  }
+}
+
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
 
@@ -76,114 +221,69 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isGenerating = false;
   bool _isRecording = false;
   bool _isServerOnline = false;
-  bool _isPhoneOnline = true; // À simplifier, on suppose true si on n'attrape pas l'erreur
+  String _loadingStatus = "Connexion au Batcave...";
 
-  double _loadingProgress = 0.0;
-  String _loadingStatus = "Initialisation...";
-
-  // Métriques
-  int _currentTps = 0;
-  int _totalRamMb = 0;
   int _usedRamMb = 0;
-  Timer? _ramTimer;
+  final int _totalRamMb = 8192; // 8 Go
 
-  // Modèle
-  final String _modelName = "Gemma 3n E4B"; // Change en E2B quand tu changeras de modèle
-  LiteLmEngine? _engine;
-  LiteLmConversation? _conversation;
-  StreamSubscription? _subscription;
+  late FlutterBackgroundService _service;
 
   @override
   void initState() {
     super.initState();
-    _initModel();
-    _startRamTracker();
+    _service = FlutterBackgroundService();
+    _connectToService();
   }
 
-  void _startRamTracker() {
-    _ramTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
-      if (_isModelLoading) return;
-      final info = ProcessInfo.currentRss; // RAM utilisée par l'app en bytes
+  void _connectToService() {
+    // Écouter les mises à jour du service en arrière-plan
+    _service.on('model_loaded').listen((event) {
       setState(() {
-        _usedRamMb = (info / (1024 * 1024)).round();
+        _isModelLoading = false;
+        _messages.add({"role": "alfred", "text": "Bonjour Monsieur. Système activé. Je suis à votre écoute.", "tps": 0});
       });
     });
-  }
 
-  Future<void> _initModel() async {
-    try {
-      setState(() { _loadingStatus = "Connexion au Batcave..."; _loadingProgress = 0.1; });
-      final serverData = await _serverManager.checkServerAndGetMemory();
-      _isServerOnline = serverData['online'];
-
-      setState(() { _loadingStatus = "Extraction du cerveau..."; _loadingProgress = 0.3; });
-      final modelPath = await _copyAssetToCache('gemma-4-E2B-it.litertlm');
-
-      // Nothing Phone 1 a 8Go de vraie RAM physique.
-      // On fixe la limite à 8Go pour éviter d'utiliser la RAM virtuelle (qui ferait crasher l'IA).
-      _totalRamMb = 8192;
-
-      setState(() { _loadingStatus = "Allumage du moteur GPU LiteRT..."; _loadingProgress = 0.5; });
-      final tempDir = await getTemporaryDirectory();
-      final cacheDir = Directory('${tempDir.path}/litert_cache');
-      if (!await cacheDir.exists()) await cacheDir.create(recursive: true);
-
-      _engine = await LiteLmEngine.create(
-        LiteLmEngineConfig(
-          modelPath: modelPath,
-          backend: LiteLmBackend.gpu,
-          cacheDir: cacheDir.path,
-          maxNumTokens: 2048,
-        ),
-      );
-
-      setState(() { _loadingStatus = "Configuration d'ALFRED..."; _loadingProgress = 0.8; });
-      _conversation = await _engine?.createConversation(
-        LiteLmConversationConfig(
-          systemInstruction: "Tu es ALFRED, un majordome. Tu es poli et devoue. Tu appelles l'utilisateur 'Monsieur'.",
-          samplerConfig: LiteLmSamplerConfig(temperature: 0.7, topK: 40, topP: 0.9),
-        ),
-      );
-
-      setState(() { _loadingStatus = "Système prêt."; _loadingProgress = 1.0; });
-      await Future.delayed(const Duration(milliseconds: 500));
-
+    _service.on('model_error').listen((event) {
       setState(() {
-        _messages.add({"role": "alfred", "text": "Bonjour Monsieur. Système mobile activé. Je suis à votre écoute.", "tps": 0});
         _isModelLoading = false;
+        _loadingStatus = "Erreur: ${event?['error']}";
       });
-    } catch (e) {
+    });
+
+    _service.on('ram_update').listen((event) {
       setState(() {
-        _messages.add({"role": "alfred", "text": "Erreur critique: $e", "tps": 0});
-        _isModelLoading = false;
+        _usedRamMb = event?['used'] ?? 0;
       });
-    }
-  }
+    });
 
-  Future<String> _copyAssetToCache(String assetName) async {
-    // On va chercher le dossier de stockage externe de l'app
-    final dir = await getExternalStorageDirectory();
-    if (dir == null) throw Exception("Impossible d'accéder au stockage.");
+    _service.on('new_token').listen((event) {
+      if (_messages.isNotEmpty) {
+        setState(() {
+          _messages[_messages.length - 1]['text'] = event?['text'];
+          _messages[_messages.length - 1]['tps'] = event?['tps'];
+        });
+      }
+    });
 
-    final file = File('${dir.path}/$assetName');
+    _service.on('generation_done').listen((event) {
+      setState(() => _isGenerating = false);
+    });
 
-    // Si le modèle est déjà là, on le charge !
-    if (await file.exists()) {
-      return file.path;
-    }
+    _service.on('generation_error').listen((event) {
+      setState(() {
+        if (_messages.isNotEmpty) _messages[_messages.length - 1]['text'] = "Erreur: ${event?['error']}";
+        _isGenerating = false;
+      });
+    });
 
-    // Sinon, on lève une erreur très claire pour dire à l'utilisateur quoi faire
-    throw Exception(
-        "Modèle introuvable.\n\n"
-            "Veuillez copier manuellement le fichier '$assetName' dans le dossier :\n"
-            "${dir.path}\n\n"
-            "Puis relancez l'application."
-    );
+    // Demander l'état actuel au service
+    _service.invoke('check_status');
   }
 
   Future<void> _sendMessage({String? audioPath}) async {
     final userText = _inputController.text.trim();
-    if ((userText.isEmpty && audioPath == null) || _isGenerating || _conversation == null) return;
+    if ((userText.isEmpty && audioPath == null) || _isGenerating) return;
 
     setState(() {
       if (userText.isNotEmpty) _messages.add({"role": "user", "text": userText, "tps": 0});
@@ -191,62 +291,18 @@ class _ChatScreenState extends State<ChatScreen> {
 
       _inputController.clear();
       _isGenerating = true;
-      _currentTps = 0;
-      _messages.add({"role": "alfred", "text": "", "tps": 0}); // Message vide pour le streaming
+      _messages.add({"role": "alfred", "text": "", "tps": 0});
     });
 
-    try {
-      final serverData = await _serverManager.checkServerAndGetMemory();
-      final memory = serverData['memory'];
-      final promptText = "Memoire: $memory\n\nQuestion: $userText";
+    final serverData = await _serverManager.checkServerAndGetMemory();
+    final memory = serverData['memory'];
+    final promptText = "Memoire: $memory\n\nQuestion: $userText";
 
-      final buffer = StringBuffer();
-      int currentMsgIndex = _messages.length - 1;
-      int tokenCount = 0;
-      DateTime startTime = DateTime.now();
-
-      final contents = [
-        LiteLmContent.text(promptText),
-        if (audioPath != null) LiteLmContent.audioFile(audioPath),
-      ];
-
-      _subscription = _conversation!.sendMultimodalMessageStream(contents).listen(
-            (delta) {
-          final text = delta.text;
-          if (text.isNotEmpty) {
-            buffer.write(text);
-            tokenCount++;
-
-            // Calcul des tokens/s
-            final elapsedMs = DateTime.now().difference(startTime).inMilliseconds;
-            if (elapsedMs > 0) {
-              _currentTps = (tokenCount / (elapsedMs / 1000)).round();
-            }
-
-            setState(() {
-              _messages[currentMsgIndex]['text'] = buffer.toString();
-              _messages[currentMsgIndex]['tps'] = _currentTps;
-            });
-          }
-        },
-        onDone: () => setState(() => _isGenerating = false),
-        onError: (e) {
-          setState(() {
-            _messages[currentMsgIndex]['text'] = "Erreur: $e";
-            _isGenerating = false;
-          });
-        },
-      );
-    } catch (e) {
-      setState(() {
-        _messages.add({"role": "alfred", "text": "Erreur: $e", "tps": 0});
-        _isGenerating = false;
-      });
-    }
+    _service.invoke('send_message', {'prompt': promptText, 'audioPath': audioPath});
   }
 
   void _stopGeneration() {
-    _subscription?.cancel();
+    _service.invoke('stop_generation');
     setState(() => _isGenerating = false);
   }
 
@@ -262,8 +318,18 @@ class _ChatScreenState extends State<ChatScreen> {
     } else {
       if (await _audioRecorder.hasPermission()) {
         final tempDir = await getTemporaryDirectory();
-        final path = '${tempDir.path}/alfred_voice.m4a';
-        await _audioRecorder.start(const RecordConfig(), path: path);
+        // On change .m4a en .wav
+        final path = '${tempDir.path}/alfred_voice.wav';
+
+        // On force la configuration audio (16kHz, Mono, PCM)
+        await _audioRecorder.start(
+          const RecordConfig(
+            encoder: AudioEncoder.wav,
+            sampleRate: 16000,
+            numChannels: 1,
+          ),
+          path: path,
+        );
         setState(() => _isRecording = true);
       }
     }
@@ -271,10 +337,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
-    _ramTimer?.cancel();
-    _subscription?.cancel();
-    _conversation?.dispose();
-    _engine?.dispose();
     _audioRecorder.dispose();
     super.dispose();
   }
@@ -288,7 +350,6 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  // --- APP BAR ---
   PreferredSizeWidget _buildAppBar() {
     return AppBar(
       title: Row(
@@ -300,26 +361,20 @@ class _ChatScreenState extends State<ChatScreen> {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
             decoration: BoxDecoration(border: Border.all(color: batLightGrey, width: 1), borderRadius: BorderRadius.circular(4)),
-            child: Text(_modelName, style: const TextStyle(color: Colors.grey, fontSize: 10)),
+            child: const Text(modelName, style: TextStyle(color: Colors.grey, fontSize: 10)),
           ),
         ],
       ),
       actions: [
-        // Indicateur Serveur (Batcave)
         Tooltip(
-          message: _isServerOnline ? "Serveur Batcave Connecté" : "Serveur Hors-ligne",
-          child: Icon(
-            _isServerOnline ? Icons.cloud_done : Icons.cloud_off,
-            color: _isServerOnline ? batYellow : batRed,
-            size: 20,
-          ),
+          message: _isServerOnline ? "Serveur Connecté" : "Serveur Hors-ligne",
+          child: Icon(_isServerOnline ? Icons.cloud_done : Icons.cloud_off, color: _isServerOnline ? batYellow : batRed, size: 20),
         ),
         const SizedBox(width: 15),
       ],
     );
   }
 
-  // --- ÉCRAN DE CHARGEMENT ---
   Widget _buildLoadingScreen() {
     return Center(
       child: Padding(
@@ -331,25 +386,17 @@ class _ChatScreenState extends State<ChatScreen> {
             const SizedBox(height: 40),
             const Text('ALFRED', style: TextStyle(fontSize: 32, fontWeight: FontWeight.w900, letterSpacing: 5, color: batYellow)),
             const SizedBox(height: 40),
-            LinearProgressIndicator(
-              value: _loadingProgress,
-              backgroundColor: batMidGrey,
-              color: batYellow,
-              minHeight: 4,
-            ),
+            const CircularProgressIndicator(color: batYellow),
             const SizedBox(height: 20),
             Text(_loadingStatus, textAlign: TextAlign.center, style: TextStyle(color: Colors.grey[600], fontSize: 14)),
-            const SizedBox(height: 5),
-            Text("${(_loadingProgress * 100).toInt()}%", style: const TextStyle(color: Colors.grey, fontSize: 12)),
           ],
         ),
       ),
     );
   }
 
-  // --- ÉCRAN DE DISCUSSION ---
   Widget _buildChatScreen() {
-    double ramPercent = _totalRamMb > 0 ? (_usedRamMb / _totalRamMb) * 100 : 0;
+    double ramPercent = (_usedRamMb / _totalRamMb) * 100;
     double usedRamGb = _usedRamMb / 1024;
     double totalRamGb = _totalRamMb / 1024;
 
@@ -399,11 +446,10 @@ class _ChatScreenState extends State<ChatScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // On remplace Text par SelectableText
                       SelectableText(
                         msg['text']!,
                         style: const TextStyle(color: Colors.white, fontSize: 15, height: 1.4),
-                        cursorColor: batYellow, // Le curseur sera jaune Batman
+                        cursorColor: batYellow,
                         toolbarOptions: const ToolbarOptions(copy: true, selectAll: true),
                       ),
                       if (!isUser && msg['tps'] > 0 && (index == _messages.length - 1 && _isGenerating))
@@ -425,7 +471,6 @@ class _ChatScreenState extends State<ChatScreen> {
           decoration: BoxDecoration(color: batDarkGrey, border: Border(top: BorderSide(color: batMidGrey, width: 1))),
           child: Row(
             children: [
-              // Bouton Micro
               GestureDetector(
                 onTap: _toggleRecording,
                 child: Container(
@@ -435,11 +480,10 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ),
               const SizedBox(width: 10),
-              // Champ texte
               Expanded(
                 child: TextField(
                   controller: _inputController,
-                  textCapitalization: TextCapitalization.sentences, // Majuscule au début
+                  textCapitalization: TextCapitalization.sentences,
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
                     hintText: "Écrivez...",
@@ -453,7 +497,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ),
               const SizedBox(width: 10),
-              // Bouton Envoyer / Stop
               GestureDetector(
                 onTap: _isGenerating ? _stopGeneration : () => _sendMessage(),
                 child: Container(
