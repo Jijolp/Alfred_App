@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 
 // Couleurs Batman
 const batBlack = Color(0xFF050505);
@@ -446,11 +447,16 @@ class _ChatScreenState extends State<ChatScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      SelectableText(
-                        msg['text']!,
-                        style: const TextStyle(color: Colors.white, fontSize: 15, height: 1.4),
-                        cursorColor: batYellow,
-                        toolbarOptions: const ToolbarOptions(copy: true, selectAll: true),
+                      MarkdownBody(
+                        data: msg['text']!,
+                        selectable: true,
+                        styleSheet: MarkdownStyleSheet(
+                          p: const TextStyle(color: Colors.white, fontSize: 15, height: 1.4),
+                          // Les mots en **gras** seront en jaune Batman !
+                          strong: const TextStyle(color: batYellow, fontWeight: FontWeight.bold),
+                          // Les mots en *italique* seront en gris clair
+                          em: const TextStyle(color: Colors.grey, fontStyle: FontStyle.italic),
+                        ),
                       ),
                       if (!isUser && msg['tps'] > 0 && (index == _messages.length - 1 && _isGenerating))
                         Padding(
