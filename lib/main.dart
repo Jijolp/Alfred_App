@@ -10,6 +10,8 @@ import 'package:record/record.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'dart:collection';
 
 // Couleurs Batman
 const batBlack = Color(0xFF050505);
@@ -136,6 +138,9 @@ void onStart(ServiceInstance service) async {
     final prompt = event?['prompt'] as String;
     final audioPath = event?['audioPath'] as String?;
 
+    // On retient si l'utilisateur a parlé
+    bool isAudioMessage = audioPath != null;
+
     final contents = [
       LiteLmContent.text(prompt),
       if (audioPath != null) LiteLmContent.audioFile(audioPath),
@@ -156,7 +161,7 @@ void onStart(ServiceInstance service) async {
           service.invoke('new_token', {'text': buffer.toString(), 'tps': tps});
         }
       },
-      onDone: () => service.invoke('generation_done'),
+      onDone: () => service.invoke('generation_done', {'speak': isAudioMessage}),
       onError: (e) => service.invoke('generation_error', {'error': e.toString()}),
     );
 
@@ -217,6 +222,12 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<Map<String, dynamic>> _messages = [];
   final ServerManager _serverManager = ServerManager();
   final AudioRecorder _audioRecorder = AudioRecorder();
+  final FlutterTts _flutterTts = FlutterTts();
+  bool _isSpeaking = false;
+
+  bool _shouldSpeakResponse = false;
+  int _queuedTextLength = 0; // Remplace _ttsBuffer par la longueur du texte mis en file
+  final Queue<String> _ttsQueue = Queue<String>(); // La file d'attente des phrases
 
   bool _isModelLoading = true;
   bool _isGenerating = false;
@@ -233,7 +244,51 @@ class _ChatScreenState extends State<ChatScreen> {
   void initState() {
     super.initState();
     _service = FlutterBackgroundService();
+    _initTts();
     _connectToService();
+  }
+
+  Future<void> _initTts() async {
+    await _flutterTts.setLanguage("fr-FR");
+    await _flutterTts.setSpeechRate(0.45);
+    await _flutterTts.setPitch(0.8);
+
+    // Recherche de voix masculine (garde celle que tu as trouvée manuellement si le code la trouve)
+    List<dynamic> voices = await _flutterTts.getVoices;
+    for (var voice in voices) {
+      String voiceStr = voice.toString().toLowerCase();
+      if (voiceStr.contains('fr') && (voiceStr.contains('male') || voiceStr.contains('homme'))) {
+        await _flutterTts.setVoice(voice);
+        break;
+      }
+    }
+
+    _flutterTts.setStartHandler(() {
+      setState(() => _isSpeaking = true);
+    });
+
+    // Quand il finit de lire une phrase, on lui demande de lire la suivante dans la file
+    _flutterTts.setCompletionHandler(() {
+      if (_ttsQueue.isNotEmpty) {
+        String nextSentence = _ttsQueue.removeFirst();
+        _flutterTts.speak(nextSentence);
+      } else {
+        setState(() => _isSpeaking = false);
+      }
+    });
+  }
+
+  void _addToTtsQueue(String sentence) {
+    if (sentence.trim().isEmpty) return;
+
+    if (!_isSpeaking && _ttsQueue.isEmpty) {
+      // Si personne ne parle, on lance directement la phrase
+      setState(() => _isSpeaking = true);
+      _flutterTts.speak(sentence);
+    } else {
+      // Sinon, on la met dans la file d'attente
+      _ttsQueue.add(sentence);
+    }
   }
 
   void _connectToService() {
@@ -258,17 +313,53 @@ class _ChatScreenState extends State<ChatScreen> {
       });
     });
 
-    _service.on('new_token').listen((event) {
+    _service.on('new_token').listen((event) async {
       if (_messages.isNotEmpty) {
         setState(() {
           _messages[_messages.length - 1]['text'] = event?['text'];
           _messages[_messages.length - 1]['tps'] = event?['tps'];
         });
+
+        if (_shouldSpeakResponse) {
+          String currentText = event?['text'] ?? "";
+
+          if (currentText.length > _queuedTextLength) {
+            int lastEnd = -1;
+            for (var char in ['.', '!', '?', '\n']) {
+              int idx = currentText.lastIndexOf(char);
+              if (idx > lastEnd) lastEnd = idx;
+            }
+
+            if (lastEnd != -1 && lastEnd >= _queuedTextLength) {
+              // On extrait la ou les nouvelles phrases complètes
+              String newSentences = currentText.substring(_queuedTextLength, lastEnd + 1);
+              _queuedTextLength = lastEnd + 1;
+
+              String cleanSentences = newSentences.replaceAll('*', '').replaceAll('#', '').trim();
+              if (cleanSentences.isNotEmpty) {
+                _addToTtsQueue(cleanSentences);
+              }
+            }
+          }
+        }
       }
     });
 
-    _service.on('generation_done').listen((event) {
+    _service.on('generation_done').listen((event) async {
       setState(() => _isGenerating = false);
+
+      if (_shouldSpeakResponse && _messages.isNotEmpty) {
+        String finalText = _messages.last['text'] ?? "";
+        if (finalText.length > _queuedTextLength) {
+          String remainingText = finalText.substring(_queuedTextLength);
+          _queuedTextLength = finalText.length;
+          String cleanRemaining = remainingText.replaceAll('*', '').replaceAll('#', '').trim();
+          if (cleanRemaining.isNotEmpty) {
+            _addToTtsQueue(cleanRemaining);
+          }
+        }
+      }
+      _shouldSpeakResponse = false;
     });
 
     _service.on('generation_error').listen((event) {
@@ -283,6 +374,11 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _sendMessage({String? audioPath}) async {
+    _flutterTts.stop();
+    _ttsQueue.clear(); // On vide la file d'attente
+    _shouldSpeakResponse = (audioPath != null);
+    _queuedTextLength = 0;
+
     final userText = _inputController.text.trim();
     if ((userText.isEmpty && audioPath == null) || _isGenerating) return;
 
@@ -304,7 +400,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _stopGeneration() {
     _service.invoke('stop_generation');
-    setState(() => _isGenerating = false);
+    _flutterTts.stop();
+    _ttsQueue.clear(); // On vide la file si on coupe la parole
+    setState(() => _isSpeaking = false);
   }
 
   Future<void> _toggleRecording() async {
@@ -477,6 +575,7 @@ class _ChatScreenState extends State<ChatScreen> {
           decoration: BoxDecoration(color: batDarkGrey, border: Border(top: BorderSide(color: batMidGrey, width: 1))),
           child: Row(
             children: [
+              // 1. Bouton Micro (Gauche)
               GestureDetector(
                 onTap: _toggleRecording,
                 child: Container(
@@ -486,6 +585,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ),
               const SizedBox(width: 10),
+
+              // 2. Champ Texte (Centre)
               Expanded(
                 child: TextField(
                   controller: _inputController,
@@ -503,12 +604,30 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ),
               const SizedBox(width: 10),
+
+              // 3. Bouton Action (Droite : Envoyer / Stop / Couper Voix)
               GestureDetector(
-                onTap: _isGenerating ? _stopGeneration : () => _sendMessage(),
+                onTap: () {
+                  if (_isSpeaking) {
+                    _flutterTts.stop();
+                    setState(() => _isSpeaking = false);
+                  } else if (_isGenerating) {
+                    _stopGeneration();
+                  } else {
+                    _sendMessage();
+                  }
+                },
                 child: Container(
                   padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(color: _isGenerating ? batRed : batYellow, shape: BoxShape.circle),
-                  child: Icon(_isGenerating ? Icons.stop : Icons.send, color: batBlack, size: 20),
+                  decoration: BoxDecoration(
+                      color: _isSpeaking ? batYellow : (_isGenerating ? batRed : batYellow),
+                      shape: BoxShape.circle
+                  ),
+                  child: Icon(
+                      _isSpeaking ? Icons.volume_up : (_isGenerating ? Icons.stop : Icons.send),
+                      color: batBlack,
+                      size: 20
+                  ),
                 ),
               ),
             ],
